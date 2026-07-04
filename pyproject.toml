@@ -3,7 +3,7 @@ name = "llm-recipes"
 version = "0.1.0"
 description = "Educational implementations of modern LLM architectures from the ground up."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = "Apache-2.0"
 authors = [
     { name = "Kamron M" },
@@ -31,4 +31,4 @@ package = false
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py312"
