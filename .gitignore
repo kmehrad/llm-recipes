@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Environments
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data, checkpoints, and generated outputs
+data/
+datasets/
+weights/
+checkpoints/
+outputs/
+runs/
+wandb/
+logs/
+
+# Hugging Face caches
+.cache/
+hf_cache/
+huggingface/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
