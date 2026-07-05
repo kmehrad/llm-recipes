@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+title: "llm-recipes"
+message: "If you use this repository, please cite it as below."
+type: software
+authors:
+  - name: "Kamron M"
+repository-code: "https://github.com/kmehrad/llm-recipes"
+license: "Apache-2.0"
+
