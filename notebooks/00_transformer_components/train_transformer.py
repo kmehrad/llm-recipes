@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 from itertools import islice, zip_longest
+import json
 import math
 from pathlib import Path
 import random
@@ -18,7 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tokenizers import Tokenizer
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm.auto import tqdm
 
 
@@ -82,6 +83,42 @@ class ParallelTextDataset(Dataset):
             "source_ids": self._encode(source_text),
             "target_ids": self._encode(target_text),
         }
+
+
+def source_grouped_split(
+    dataset: ParallelTextDataset,
+    validation_examples: int,
+    seed: int,
+) -> tuple[Subset, Subset, list[int]]:
+    """Split complete English-source groups into train and validation sets."""
+    if validation_examples <= 0 or validation_examples >= len(dataset):
+        raise ValueError("--validation-examples must be between 1 and dataset size - 1")
+
+    source_groups: dict[str, list[int]] = {}
+    for index, (source_text, _target_text) in enumerate(dataset.pairs):
+        source_groups.setdefault(source_text, []).append(index)
+
+    groups = list(source_groups.values())
+    random.Random(seed).shuffle(groups)
+    validation_indices: list[int] = []
+    for group in groups:
+        if len(validation_indices) + len(group) <= validation_examples:
+            validation_indices.extend(group)
+            if len(validation_indices) == validation_examples:
+                break
+
+    if not validation_indices:
+        raise ValueError("Could not construct a source-grouped validation split")
+    validation_indices.sort()
+    validation_set = set(validation_indices)
+    train_indices = [
+        index for index in range(len(dataset)) if index not in validation_set
+    ]
+    return (
+        Subset(dataset, train_indices),
+        Subset(dataset, validation_indices),
+        validation_indices,
+    )
 
 
 class TranslationCollator:
@@ -451,6 +488,11 @@ def evaluate(
     return loss_sum / max(token_count, 1)
 
 
+def append_history(path: Path, record: dict[str, object]) -> None:
+    with path.open("a", encoding="utf-8") as history_file:
+        history_file.write(json.dumps(record, sort_keys=True) + "\n")
+
+
 def save_checkpoint(
     path: Path,
     model: Transformer,
@@ -461,6 +503,9 @@ def save_checkpoint(
     update: int,
     best_validation_loss: float,
     elapsed_seconds: float,
+    validation_indices: list[int],
+    early_stopping_bad_checks: int,
+    training_args: dict[str, object],
 ) -> None:
     state = {
         "model": model.state_dict(),
@@ -470,10 +515,18 @@ def save_checkpoint(
         "next_batch": next_batch,
         "update": update,
         "best_validation_loss": best_validation_loss,
+        "early_stopping_bad_checks": early_stopping_bad_checks,
         "elapsed_seconds": elapsed_seconds,
         "torch_rng_state": torch.get_rng_state(),
         "cuda_rng_state_all": torch.cuda.get_rng_state_all(),
         "python_rng_state": random.getstate(),
+        "split": {
+            "strategy": "grouped_by_exact_source_v1",
+            "validation_indices": validation_indices,
+            "validation_examples": len(validation_indices),
+            "seed": training_args["seed"],
+        },
+        "training_args": training_args,
         "config": {
             "vocab_size": model.token_embeddings.num_embeddings,
             "embedding_dim": EMBEDDING_DIM,
@@ -493,16 +546,25 @@ def save_checkpoint(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--max-hours", type=float, default=8.0, help="Hours for this run")
+    parser.add_argument("--max-epochs", type=int, default=200)
     parser.add_argument("--max-updates", type=int, default=None, help="Total update limit")
     parser.add_argument("--micro-batch-size", type=int, default=64)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
     parser.add_argument("--validation-examples", type=int, default=5_000)
     parser.add_argument("--validation-interval", type=int, default=500)
+    parser.add_argument("--early-stopping-patience", type=int, default=10)
+    parser.add_argument("--early-stopping-min-delta", type=float, default=0.001)
     parser.add_argument("--checkpoint-interval", type=int, default=100)
     parser.add_argument("--log-interval", type=int, default=20)
     parser.add_argument("--warmup-steps", type=int, default=4_000)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Checkpoint/log directory (default: checkpoints/transformer_en_de)",
+    )
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
 
@@ -511,8 +573,16 @@ def main() -> None:
     args = parse_args()
     if args.max_hours <= 0:
         raise ValueError("--max-hours must be positive")
+    if args.max_epochs <= 0:
+        raise ValueError("--max-epochs must be positive")
     if args.gradient_accumulation_steps <= 0:
         raise ValueError("--gradient-accumulation-steps must be positive")
+    if args.validation_interval <= 0:
+        raise ValueError("--validation-interval must be positive")
+    if args.early_stopping_patience <= 0:
+        raise ValueError("--early-stopping-patience must be positive")
+    if args.early_stopping_min_delta < 0:
+        raise ValueError("--early-stopping-min-delta cannot be negative")
     if not torch.cuda.is_available():
         raise RuntimeError("This training script expects a CUDA GPU")
 
@@ -520,10 +590,13 @@ def main() -> None:
     tokenizer_path = repo_root / "data/tokenizers/tatoeba_bpe_en_de.json"
     english_path = repo_root / "data/raw/tatoeba_en_de/Tatoeba.de-en.en"
     german_path = repo_root / "data/raw/tatoeba_en_de/Tatoeba.de-en.de"
-    checkpoint_dir = repo_root / "checkpoints/transformer_en_de"
+    checkpoint_dir = args.output_dir or repo_root / "checkpoints/transformer_en_de"
+    if not checkpoint_dir.is_absolute():
+        checkpoint_dir = repo_root / checkpoint_dir
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     latest_checkpoint_path = checkpoint_dir / "latest.pt"
     best_checkpoint_path = checkpoint_dir / "best.pt"
+    history_path = checkpoint_dir / "history.jsonl"
 
     tokenizer = Tokenizer.from_file(str(tokenizer_path))
     vocab_size = tokenizer.get_vocab_size()
@@ -533,14 +606,19 @@ def main() -> None:
     all_dataset = ParallelTextDataset(
         english_path, german_path, tokenizer, CONTEXT_LENGTH
     )
-    train_size = len(all_dataset) - args.validation_examples
-    if train_size <= 0:
-        raise ValueError("--validation-examples must be smaller than the dataset")
-    train_dataset, validation_dataset = random_split(
-        all_dataset,
-        [train_size, args.validation_examples],
-        generator=torch.Generator().manual_seed(args.seed),
+    train_dataset, validation_dataset, validation_indices = source_grouped_split(
+        all_dataset, args.validation_examples, args.seed
     )
+    training_args: dict[str, object] = {
+        "seed": args.seed,
+        "validation_examples": args.validation_examples,
+        "warmup_steps": args.warmup_steps,
+        "micro_batch_size": args.micro_batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "validation_interval": args.validation_interval,
+        "early_stopping_patience": args.early_stopping_patience,
+        "early_stopping_min_delta": args.early_stopping_min_delta,
+    }
     collator = TranslationCollator(pad_token_id)
 
     def make_train_loader(epoch_number: int) -> DataLoader:
@@ -553,7 +631,7 @@ def main() -> None:
             num_workers=args.num_workers,
             pin_memory=True,
             persistent_workers=args.num_workers > 0,
-            drop_last=True,
+            drop_last=False,
         )
 
     validation_loader = DataLoader(
@@ -588,12 +666,33 @@ def main() -> None:
     scaler = torch.amp.GradScaler("cuda", enabled=not use_bf16)
     epoch = next_batch = update = 0
     best_validation_loss = math.inf
+    early_stopping_bad_checks = 0
     previous_elapsed = 0.0
 
     if args.resume and latest_checkpoint_path.exists():
         checkpoint = torch.load(
             latest_checkpoint_path, map_location="cpu", weights_only=False
         )
+        checkpoint_split = checkpoint.get("split")
+        if checkpoint_split is None:
+            raise ValueError(
+                "The checkpoint uses the legacy row-random split. Resume it with the "
+                "old script, or start this grouped-split run with --no-resume."
+            )
+        if checkpoint_split.get("strategy") != "grouped_by_exact_source_v1":
+            raise ValueError(f"Unsupported checkpoint split: {checkpoint_split}")
+        if checkpoint_split.get("validation_indices") != validation_indices:
+            raise ValueError(
+                "Checkpoint validation split does not match --seed/"
+                "--validation-examples; use matching settings or --no-resume."
+            )
+        saved_args = checkpoint.get("training_args", {})
+        for name in ("seed", "validation_examples", "warmup_steps"):
+            if saved_args.get(name) != training_args[name]:
+                raise ValueError(
+                    f"Checkpoint {name}={saved_args.get(name)!r} does not match "
+                    f"current value {training_args[name]!r}"
+                )
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         if "scaler" in checkpoint:
@@ -602,6 +701,9 @@ def main() -> None:
         next_batch = checkpoint["next_batch"]
         update = checkpoint["update"]
         best_validation_loss = checkpoint["best_validation_loss"]
+        early_stopping_bad_checks = checkpoint.get(
+            "early_stopping_bad_checks", 0
+        )
         previous_elapsed = checkpoint.get("elapsed_seconds", 0.0)
         if "torch_rng_state" in checkpoint:
             torch.set_rng_state(checkpoint["torch_rng_state"])
@@ -613,6 +715,8 @@ def main() -> None:
             f"Resumed update {update:,}, epoch {epoch + 1}, batch {next_batch:,}",
             flush=True,
         )
+    elif not args.resume:
+        history_path.write_text("", encoding="utf-8")
 
     stop_requested = False
 
@@ -644,7 +748,10 @@ def main() -> None:
     last_batch = next_batch - 1
     accumulation_count = 0
 
-    while not stop:
+    interval_loss_sum = 0.0
+    interval_target_tokens = 0
+    stop_reason = "unknown"
+    while not stop and epoch < args.max_epochs:
         loader = make_train_loader(epoch)
         progress = tqdm(
             enumerate(loader), total=len(loader), desc=f"epoch {epoch + 1}"
@@ -659,8 +766,12 @@ def main() -> None:
                 batch["source_ids"].ne(pad_token_id).sum()
                 + batch["labels"].ne(pad_token_id).sum()
             ).item()
+            target_tokens = batch["labels"].ne(pad_token_id).sum().item()
             with torch.autocast("cuda", dtype=amp_dtype):
-                loss = model(**batch)["loss"] / args.gradient_accumulation_steps
+                batch_loss = model(**batch)["loss"]
+                loss = batch_loss / args.gradient_accumulation_steps
+            interval_loss_sum += batch_loss.item() * target_tokens
+            interval_target_tokens += target_tokens
             scaler.scale(loss).backward()
             accumulation_count += 1
             if accumulation_count < args.gradient_accumulation_steps:
@@ -680,11 +791,27 @@ def main() -> None:
             total_elapsed = previous_elapsed + session_elapsed
 
             if update % args.log_interval == 0:
+                mean_training_loss = interval_loss_sum / max(
+                    interval_target_tokens, 1
+                )
                 progress.set_postfix(
-                    loss=f"{loss.item() * args.gradient_accumulation_steps:.3f}",
+                    loss=f"{mean_training_loss:.3f}",
                     lr=f"{learning_rate:.2e}",
                     tokens=f"{token_count:,}",
                 )
+                append_history(
+                    history_path,
+                    {
+                        "event": "train",
+                        "epoch": epoch + 1,
+                        "update": update,
+                        "training_loss": mean_training_loss,
+                        "learning_rate": learning_rate,
+                        "elapsed_hours": total_elapsed / 3600,
+                    },
+                )
+                interval_loss_sum = 0.0
+                interval_target_tokens = 0
             token_count = 0
 
             if update % args.validation_interval == 0:
@@ -696,8 +823,27 @@ def main() -> None:
                     f"total {total_elapsed / 3600:.2f} h",
                     flush=True,
                 )
-                if validation_loss < best_validation_loss:
+                improved = (
+                    validation_loss
+                    < best_validation_loss - args.early_stopping_min_delta
+                )
+                append_history(
+                    history_path,
+                    {
+                        "event": "validation",
+                        "epoch": epoch + 1,
+                        "update": update,
+                        "validation_loss": validation_loss,
+                        "best_validation_loss": (
+                            validation_loss if improved else best_validation_loss
+                        ),
+                        "improved": improved,
+                        "elapsed_hours": total_elapsed / 3600,
+                    },
+                )
+                if improved:
                     best_validation_loss = validation_loss
+                    early_stopping_bad_checks = 0
                     save_checkpoint(
                         best_checkpoint_path,
                         model,
@@ -708,6 +854,17 @@ def main() -> None:
                         update,
                         best_validation_loss,
                         total_elapsed,
+                        validation_indices,
+                        early_stopping_bad_checks,
+                        training_args,
+                    )
+                else:
+                    early_stopping_bad_checks += 1
+                    print(
+                        "No material validation improvement "
+                        f"({early_stopping_bad_checks}/"
+                        f"{args.early_stopping_patience})",
+                        flush=True,
                     )
             if update % args.checkpoint_interval == 0:
                 save_checkpoint(
@@ -720,6 +877,9 @@ def main() -> None:
                     update,
                     best_validation_loss,
                     total_elapsed,
+                    validation_indices,
+                    early_stopping_bad_checks,
+                    training_args,
                 )
                 print(f"Saved checkpoint at update {update:,}", flush=True)
 
@@ -728,10 +888,22 @@ def main() -> None:
             )
             if stop_requested or reached_update_limit or session_elapsed >= args.max_hours * 3600:
                 stop = True
+                if stop_requested:
+                    stop_reason = "signal"
+                elif reached_update_limit:
+                    stop_reason = "update limit"
+                else:
+                    stop_reason = "session time limit"
+                break
+            if early_stopping_bad_checks >= args.early_stopping_patience:
+                stop = True
+                stop_reason = "early stopping"
                 break
         if not stop:
             epoch += 1
             next_batch = 0
+    if not stop and epoch >= args.max_epochs:
+        stop_reason = "epoch limit"
 
     total_elapsed = previous_elapsed + time.monotonic() - started
     save_checkpoint(
@@ -744,9 +916,13 @@ def main() -> None:
         update,
         best_validation_loss,
         total_elapsed,
+        validation_indices,
+        early_stopping_bad_checks,
+        training_args,
     )
     print(
-        f"Stopped safely after {total_elapsed / 3600:.2f} total hours and "
+        f"Stopped safely ({stop_reason}) after "
+        f"{total_elapsed / 3600:.2f} total hours and "
         f"{update:,} updates. Latest checkpoint: {latest_checkpoint_path}",
         flush=True,
     )
