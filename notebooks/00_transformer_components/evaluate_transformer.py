@@ -46,10 +46,13 @@ def parse_args() -> argparse.Namespace:
         "--validation-examples",
         type=int,
         default=5_000,
-        help="Must match the value used during training",
+        help="Legacy checkpoints only: must match training",
     )
     parser.add_argument(
-        "--seed", type=int, default=42, help="Must match the training split seed"
+        "--seed",
+        type=int,
+        default=42,
+        help="Legacy checkpoints only: must match the training split seed",
     )
     parser.add_argument(
         "--device",
@@ -170,15 +173,33 @@ def main() -> None:
         tokenizer,
         context_length,
     )
-    train_size = len(all_dataset) - args.validation_examples
-    if train_size <= 0:
-        raise ValueError("--validation-examples must be smaller than the dataset")
-    _, validation_dataset = random_split(
-        all_dataset,
-        [train_size, args.validation_examples],
-        generator=torch.Generator().manual_seed(args.seed),
-    )
-    validation_indices = validation_dataset.indices
+    split = checkpoint.get("split")
+    if split is not None:
+        validation_indices = split.get("validation_indices")
+        if not isinstance(validation_indices, list) or not validation_indices:
+            raise ValueError("Checkpoint split metadata has no validation indices")
+        if min(validation_indices) < 0 or max(validation_indices) >= len(all_dataset):
+            raise ValueError("Checkpoint validation indices exceed the current dataset")
+        print(
+            f"Using checkpoint split {split.get('strategy')} with "
+            f"{len(validation_indices):,} validation examples",
+            flush=True,
+        )
+    else:
+        train_size = len(all_dataset) - args.validation_examples
+        if train_size <= 0:
+            raise ValueError("--validation-examples must be smaller than the dataset")
+        _, validation_dataset = random_split(
+            all_dataset,
+            [train_size, args.validation_examples],
+            generator=torch.Generator().manual_seed(args.seed),
+        )
+        validation_indices = validation_dataset.indices
+        print(
+            "Checkpoint predates stored split metadata; reconstructed the legacy "
+            "row-random split from --seed and --validation-examples.",
+            flush=True,
+        )
     if args.max_examples is not None:
         validation_indices = validation_indices[: args.max_examples]
 
