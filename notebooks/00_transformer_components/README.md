@@ -105,3 +105,42 @@ The most important defaults are:
 
 Use `Ctrl-c` once when you want to stop manually. The script finishes the
 current optimizer update, saves `latest.pt`, and exits cleanly.
+
+## Generate validation predictions
+
+Stop the training process before evaluation so both models do not compete for
+GPU memory. The evaluation script loads `best.pt` by default, reconstructs the
+same 5,000-example validation split produced with seed 42, and performs batched
+greedy decoding:
+
+```bash
+uv run python notebooks/00_transformer_components/evaluate_transformer.py
+```
+
+The completed output is written to:
+
+```text
+evaluations/transformer_en_de/best_predictions.jsonl
+```
+
+Each line is a UTF-8 JSON object with the original dataset index, English
+source, German ground truth, and generated German prediction:
+
+```json
+{"dataset_index": 123, "source": "How are you?", "target": "Wie geht es dir?", "prediction": "Wie geht es dir?"}
+```
+
+Run a quick 20-example check before evaluating the complete split:
+
+```bash
+uv run python notebooks/00_transformer_components/evaluate_transformer.py \
+  --max-examples 20 \
+  --output evaluations/transformer_en_de/quick_predictions.jsonl
+```
+
+If training used a different `--seed` or `--validation-examples` value, pass
+the same values to the evaluation script. Use `--checkpoint` to evaluate
+another checkpoint and `--batch-size` to adjust GPU memory consumption. The
+script writes to a `.tmp` file while generation is in progress and renames it
+to the requested output only after all examples finish. If interrupted, the
+partial `.tmp` file is retained.
