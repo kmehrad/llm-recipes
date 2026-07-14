@@ -118,6 +118,20 @@ def acceptable_pair(source: str, target: str) -> bool:
     return ratio <= 3.0 and len(source) <= 2_000 and len(target) <= 2_000
 
 
+def parallel_lines(source_path: Path, target_path: Path):
+    """Yield aligned records, treating only LF as a corpus record separator.
+
+    News Commentary contains bare carriage returns inside some records. Python's
+    default universal-newline mode treats those as new lines, but their counts
+    differ by language and therefore break otherwise aligned parallel data.
+    """
+    with (
+        source_path.open(encoding="utf-8", newline="\n") as source_file,
+        target_path.open(encoding="utf-8", newline="\n") as target_file,
+    ):
+        yield from zip(source_file, target_file, strict=True)
+
+
 def prepare_training_data(
     extracted_dir: Path,
     output_source: Path,
@@ -134,31 +148,27 @@ def prepare_training_data(
         for corpus in TRAINING_CORPORA:
             source_path = find_unique(extracted_dir, f"{corpus}.en")
             target_path = find_unique(extracted_dir, f"{corpus}.de")
-            with (
-                source_path.open(encoding="utf-8") as source_file,
-                target_path.open(encoding="utf-8") as target_file,
-            ):
-                iterator = zip(source_file, target_file, strict=True)
-                for source_line, target_line in tqdm(iterator, desc=corpus):
-                    counts["read"] += 1
-                    source = normalized_text(source_line)
-                    target = normalized_text(target_line)
-                    if not acceptable_pair(source, target):
-                        counts["filtered"] += 1
-                        continue
-                    digest = pair_digest(source, target)
-                    if digest in seen:
-                        counts["duplicate"] += 1
-                        continue
-                    seen.add(digest)
-                    source_output.write(source + "\n")
-                    target_output.write(target + "\n")
-                    counts["written"] += 1
-                    if (
-                        max_training_pairs is not None
-                        and counts["written"] >= max_training_pairs
-                    ):
-                        return counts
+            iterator = parallel_lines(source_path, target_path)
+            for source_line, target_line in tqdm(iterator, desc=corpus):
+                counts["read"] += 1
+                source = normalized_text(source_line)
+                target = normalized_text(target_line)
+                if not acceptable_pair(source, target):
+                    counts["filtered"] += 1
+                    continue
+                digest = pair_digest(source, target)
+                if digest in seen:
+                    counts["duplicate"] += 1
+                    continue
+                seen.add(digest)
+                source_output.write(source + "\n")
+                target_output.write(target + "\n")
+                counts["written"] += 1
+                if (
+                    max_training_pairs is not None
+                    and counts["written"] >= max_training_pairs
+                ):
+                    return counts
     return counts
 
 
