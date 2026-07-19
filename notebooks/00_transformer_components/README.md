@@ -1,187 +1,194 @@
 # Transformer component notebooks
 
-The notebooks in this directory build an English-to-German Transformer from
-its individual components. Use `4_transformer.ipynb` interactively to inspect
-the complete model and verify that training works. Its training loop defaults
-to a single optimizer update (four micro-batches) through these flags:
+These notebooks build an English-to-German Transformer from its individual
+components. Use `4_transformer.ipynb` interactively for the educational model
+walkthrough and smoke test. Long runs belong in `train_transformer.py`.
 
-```python
-notebook_smoke_test = True
-notebook_max_updates = 1
+The workflow below uses the WMT14 English-German recipe, a boundary-aware tokenizer, token batches, five retained checkpoints, checkpoint averaging, beam search, and standard translation metrics.
+
+## 1. Prepare WMT14 English-German
+
+The preparation script downloads the same three training sources used by the
+original Transformer recipe:
+
+- Europarl v7
+- Common Crawl
+- News Commentary v9
+
+It uses newstest2013 as validation and newstest2014 as the final test set. It
+also removes empty, extreme-length, badly imbalanced, exact-duplicate, and
+validation/test-identical pairs.
+
+The official archives total about 1.7 GB. Allow several additional gigabytes
+for extraction and prepared files:
+
+```bash
+uv run python notebooks/00_transformer_components/prepare_wmt14_en_de.py
 ```
 
-Keep the smoke-test flag enabled for normal notebook use. Long training runs
-belong in `train_transformer.py`, which is independent of the notebook kernel
-and automatically resumes from its latest checkpoint.
+Prepared files are written under:
 
-The notebook keeps validation disabled by default and writes its one-update
-checkpoint to `checkpoints/transformer_en_de_notebook_smoke_test/`, so it
-cannot overwrite a full training run. Hub publishing lives only in
-`5_publish_transformer_to_hf.ipynb`.
+```text
+data/processed/wmt14_en_de/train.en
+data/processed/wmt14_en_de/train.de
+data/processed/wmt14_en_de/validation.en
+data/processed/wmt14_en_de/validation.de
+data/processed/wmt14_en_de/test.en
+data/processed/wmt14_en_de/test.de
+data/processed/wmt14_en_de/metadata.json
+```
 
-## Run training over SSH
+Use `--max-training-pairs 10000` only for a preparation smoke test. Do not
+train the final model on that limited output.
 
-From the repository root, create a named `tmux` session:
+## 2. Train the boundary-aware tokenizer
+
+Train a joint 37,000-token English-German byte-level BPE vocabulary:
+
+```bash
+uv run python notebooks/00_transformer_components/train_wmt_tokenizer.py
+```
+
+This tokenizer preserves word boundaries and round-trips unseen Unicode bytes. 
+The script also writes `train.lengths.pt`, a compact cache used to form length-bucketed token
+batches without loading millions of sentences into Python objects.
+
+Outputs:
+
+```text
+data/tokenizers/wmt14_bpe_en_de.json
+data/processed/wmt14_en_de/train.lengths.pt
+```
+
+Changing the tokenizer or context length requires rebuilding the length cache.
+Training rejects a cache created by another tokenizer.
+
+## 3. Train
+
+Create a persistent terminal session:
 
 ```bash
 tmux new -s transformer
 ```
 
-Inside that session, start a clean rerun in a new directory and save the
-terminal output to a persistent log:
+Start a clean run:
 
 ```bash
 mkdir -p checkpoints/transformer_en_de
 uv run python notebooks/00_transformer_components/train_transformer.py \
   --no-resume \
-  --output-dir checkpoints/transformer_en_de \
-  --max-epochs 200 \
   2>&1 | tee -a checkpoints/transformer_en_de/training.log
 ```
 
-This preserves the previous 200-epoch run under
-`checkpoints/transformer_en_de/`. The rerun can reach 200 epochs, but normally
-stops earlier when validation loss has not materially improved for 10
-consecutive validation checks.
+The main defaults are:
 
-The full corpus has 322,406 usable sentence pairs. Training holds out 5,000
-pairs and uses every remaining pair. The split keeps all rows with the same
-English source sentence together, preventing alternate translations of one
-source from leaking across train and validation sets.
+- up to 4,096 padded source-plus-target tokens per micro-batch
+- 8-step gradient accumulation, approximately 32,768 padded tokens per update
+- maximum 256 sentence pairs per micro-batch
+- 256-token source and target context
+- 4,000 warmup updates
+- validation every 1,000 updates on newstest2013
+- retain the five checkpoints with the lowest validation losses
+- early stopping after 10 validation checks without a 0.001 improvement
+- maximum 20 epochs and eight hours per invocation
 
-Detach from `tmux` without stopping training by pressing `Ctrl-b`, releasing
-the keys, and then pressing `d`. It is safe for SSH or VS Code to disconnect
-after that. Reconnect later with:
+The token limit is a memory ceiling rather than an exact token count. If the
+GPU runs out of memory, lower `--micro-batch-tokens` and increase
+`--gradient-accumulation-steps` proportionally.
+
+Training writes:
+
+```text
+checkpoints/transformer_en_de/latest.pt
+checkpoints/transformer_en_de/best.pt
+checkpoints/transformer_en_de/best_update_*_loss_*.pt
+checkpoints/transformer_en_de/history.jsonl
+```
+
+`latest.pt` contains optimizer and resume state. The ranked
+`best_update_*.pt` files contain model weights and evaluation metadata.
+Starting the same command again without `--no-resume` resumes safely.
+
+Use `Ctrl-c` once to request a checkpoint after the current optimizer update.
+Detach from tmux with `Ctrl-b`, then `d`, and reconnect with:
 
 ```bash
 tmux attach -t transformer
 ```
 
-List existing sessions with `tmux ls`. If `tmux` is not installed on the
-workstation, install it first or ask the system administrator to do so.
+## 4. Average the five best checkpoints
 
-## Checkpoints and resume
+After training stops:
 
-Training writes atomic checkpoints under:
+```bash
+uv run python \
+  notebooks/00_transformer_components/average_transformer_checkpoints.py
+```
+
+This reads the ranked manifest from `latest.pt`, averages floating-point
+model parameters from the five lowest-loss checkpoints, validates non-floating
+buffers, and writes:
 
 ```text
-checkpoints/transformer_en_de/latest.pt
-checkpoints/transformer_en_de/best.pt
-checkpoints/transformer_en_de/history.jsonl
+checkpoints/transformer_en_de/averaged.pt
 ```
 
-`latest.pt` is saved every 100 optimizer updates and whenever the process
-receives `SIGINT` or `SIGTERM`. Starting the same command again resumes from
-`latest.pt` automatically when `--no-resume` is removed. Each invocation receives a fresh eight-hour time
-budget, so an existing checkpoint does not cause a resumed run to stop
-immediately.
+## 5. Evaluate with beam search and translation metrics
 
-To deliberately start over without loading `latest.pt`, pass `--no-resume`.
-This does not delete existing files; the new run will overwrite `latest.pt`
-when it reaches a checkpoint.
-
-Legacy checkpoints used a row-random validation split and cannot be resumed by
-the grouped-split trainer. They remain evaluable, but a new grouped run must
-use `--no-resume` or a new `--output-dir`.
-
-## Useful options
-
-Show every option:
-
-```bash
-uv run python notebooks/00_transformer_components/train_transformer.py --help
-```
-
-Run for six hours:
-
-```bash
-uv run python notebooks/00_transformer_components/train_transformer.py \
-  --output-dir checkpoints/transformer_en_de \
-  --max-hours 6
-```
-
-Stop at a total of 10,000 optimizer updates, including resumed updates:
-
-```bash
-uv run python notebooks/00_transformer_components/train_transformer.py \
-  --output-dir checkpoints/transformer_en_de \
-  --max-hours 24 \
-  --max-updates 10000
-```
-
-Reduce GPU memory usage by lowering the micro-batch size while increasing
-gradient accumulation to retain an effective batch of 256 sentence pairs:
-
-```bash
-uv run python notebooks/00_transformer_components/train_transformer.py \
-  --output-dir checkpoints/transformer_en_de \
-  --micro-batch-size 32 --gradient-accumulation-steps 8
-```
-
-The most important defaults are:
-
-- micro-batch size: 64
-- gradient accumulation: 4
-- validation interval: 500 optimizer updates
-- early-stopping patience: 10 validation checks
-- minimum validation improvement: 0.001
-- maximum epochs: 200
-- checkpoint interval: 100 optimizer updates
-- per-invocation time budget: 8 hours
-- automatic resume: enabled
-
-Use `Ctrl-c` once when you want to stop manually. The script finishes the
-current optimizer update, saves `latest.pt`, and exits cleanly.
-
-## Generate validation predictions
-
-Stop the training process before evaluation so both models do not compete for
-GPU memory. The evaluation script loads `best.pt` by default, reconstructs the
-validation indices stored inside the checkpoint and performs batched greedy
-decoding:
+Evaluate the averaged model on the untouched newstest2014 test set:
 
 ```bash
 uv run python notebooks/00_transformer_components/evaluate_transformer.py
 ```
 
-The completed output is written to:
+Defaults match the original Transformer decoding recipe: beam size 4 and
+length penalty 0.6. Evaluation writes both sentence-level JSONL predictions
+and a metrics summary:
 
 ```text
-evaluations/transformer_en_de/best_predictions.jsonl
+evaluations/transformer_en_de/newstest2014_beam4.jsonl
+evaluations/transformer_en_de/newstest2014_beam4.metrics.json
 ```
 
-Each line is a UTF-8 JSON object with the original dataset index, English
-source, German ground truth, and generated German prediction:
-
-```json
-{"dataset_index": 123, "source": "How are you?", "target": "Wie geht es dir?", "prediction": "Wie geht es dir?"}
-```
-
-Run a quick 20-example check before evaluating the complete split:
+The metrics file records sacreBLEU, chrF++, reproducibility signatures,
+checkpoint, split, beam size, and length penalty. To evaluate newstest2013 or
+compare greedy decoding:
 
 ```bash
 uv run python notebooks/00_transformer_components/evaluate_transformer.py \
-  --max-examples 20 \
-  --output evaluations/transformer_en_de/quick_predictions.jsonl
+  --split validation \
+  --output evaluations/transformer_en_de/newstest2013_beam4.jsonl
+
+uv run python notebooks/00_transformer_components/evaluate_transformer.py \
+  --beam-size 1 \
+  --length-penalty 0 \
+  --output evaluations/transformer_en_de/newstest2014_greedy.jsonl
 ```
 
-New checkpoints carry their exact validation indices, so evaluation does not
-need split arguments. The old `--seed` and `--validation-examples` options
-remain as a fallback for legacy checkpoints. Use `--checkpoint` to evaluate
-another checkpoint and `--batch-size` to adjust GPU memory consumption. The
-script writes to a `.tmp` file while generation is in progress and renames it
-to the requested output only after all examples finish. If interrupted, the
-partial `.tmp` file is retained.
+Use `--max-examples 20` for an end-to-end smoke test.
 
-## Review and optionally publish to Hugging Face
+## 6. Translate interactively
 
-Publishing is deliberately separate from training. Open
-`5_publish_transformer_to_hf.ipynb` after evaluating `best.pt`. It displays
-the checkpoint metrics and saved translation samples, exports a self-contained
-Safetensors bundle, and reloads that bundle locally.
+Load the averaged model once, then enter as many English sentences as you
+like. Press `Ctrl-D` or `Ctrl-C` to exit:
 
-The notebook defaults to `publish_to_hub = False`. If the metrics and sample
-translations are satisfactory, authenticate outside the notebook with
-`hf auth login` or `HF_TOKEN`, change the flag to `True`, and run only the
-upload cell. The exported repository includes weights, tokenizer, config,
-model/inference code, and a model card.
+```bash
+uv run python notebooks/00_transformer_components/translate_interactive.py
+```
+
+You can also translate one sentence non-interactively:
+
+```bash
+uv run python notebooks/00_transformer_components/translate_interactive.py \
+  "How are you?"
+```
+
+## 7. Optional Hugging Face publishing
+
+Open `5_publish_transformer_to_hf.ipynb` only after reviewing the averaged
+model, test metrics, and translations. It exports a self-contained bundle and
+locally reloads it before any upload.
+
+`publish_to_hub = False` is the default. Authenticate outside the notebook
+with `hf auth login` or `HF_TOKEN`, and enable the flag only when the model
+is ready to publish.
