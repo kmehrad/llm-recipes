@@ -5,7 +5,9 @@ import sys
 from safetensors.torch import save_model
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import ByteLevel
 from tokenizers.processors import TemplateProcessing
+from tokenizers.trainers import BpeTrainer
 import torch
 
 
@@ -18,11 +20,25 @@ import train_transformer as modeling_transformer  # noqa: E402
 
 sys.modules["modeling_transformer"] = modeling_transformer
 from hub_inference import TransformerTranslator  # noqa: E402
+from average_transformer_checkpoints import average_checkpoints  # noqa: E402
+from evaluate_transformer import beam_search_generate  # noqa: E402
+from prepare_wmt14_en_de import (  # noqa: E402
+    acceptable_pair,
+    normalized_text,
+    parallel_lines,
+    read_sgm_segments,
+)
 from train_transformer import (  # noqa: E402
     ParallelTextDataset,
+    TokenBucketBatchSampler,
     Transformer,
     append_history,
+    retain_best_checkpoint,
     source_grouped_split,
+)
+from train_wmt_tokenizer import (  # noqa: E402
+    SPECIAL_TOKENS,
+    build_tokenizer,
 )
 
 
@@ -112,3 +128,162 @@ def test_history_is_machine_readable_jsonl(tmp_path):
         "update": 500,
         "validation_loss": 2.75,
     }
+
+
+def test_wmt_sgm_and_filtering_helpers(tmp_path):
+    sgm_path = tmp_path / "sample.sgm"
+    sgm_path.write_text(
+        '<seg id="1">Tom &amp; Mary</seg>\n<seg id="2">  Hello   world. </seg>\n'
+    )
+
+    assert read_sgm_segments(sgm_path) == ["Tom & Mary", "Hello world."]
+    assert normalized_text("  A   B  ") == "A B"
+    assert acceptable_pair("a short source", "eine kurze Übersetzung")
+    assert not acceptable_pair("one", "eins zwei drei vier")
+
+
+def test_wmt_parallel_lines_do_not_split_on_embedded_carriage_returns(tmp_path):
+    source_path = tmp_path / "sample.en"
+    target_path = tmp_path / "sample.de"
+    source_path.write_bytes(b"first\rcontinued\nsecond\n")
+    target_path.write_bytes(b"erste Zeile\nzweite Zeile\n")
+
+    pairs = list(parallel_lines(source_path, target_path))
+
+    assert pairs == [
+        ("first\rcontinued\n", "erste Zeile\n"),
+        ("second\n", "zweite Zeile\n"),
+    ]
+
+
+def test_boundary_aware_tokenizer_round_trips_unseen_german_characters():
+    tokenizer = build_tokenizer(400)
+    tokenizer.train_from_iterator(
+        ["Ärgerst du dich?", "Do you get annoyed?", "unvollständige Übersetzungen"],
+        trainer=BpeTrainer(
+            vocab_size=400,
+            special_tokens=SPECIAL_TOKENS,
+            initial_alphabet=ByteLevel.alphabet(),
+            show_progress=False,
+        ),
+    )
+    text = "Ärgerst du dich über unvollständige Übersetzungen?"
+
+    decoded = tokenizer.decode(
+        tokenizer.encode(text).ids, skip_special_tokens=True
+    )
+
+    assert decoded == text
+
+
+def test_token_bucket_batches_cover_every_example_within_budget():
+    source_lengths = torch.tensor([4, 7, 3, 9, 5, 8])
+    target_lengths = torch.tensor([5, 6, 4, 8, 5, 7])
+    sampler = TokenBucketBatchSampler(
+        source_lengths,
+        target_lengths,
+        max_tokens=30,
+        seed=11,
+        epoch=2,
+        bucket_size=4,
+        max_sentences=3,
+    )
+
+    batches = list(sampler)
+    assert sorted(index for batch in batches for index in batch) == list(range(6))
+    for batch in batches:
+        padded_tokens = (
+            max(int(source_lengths[index]) for index in batch)
+            + max(int(target_lengths[index]) for index in batch)
+        ) * len(batch)
+        assert padded_tokens <= 30
+
+
+def test_beam_search_returns_one_sequence_per_source():
+    torch.manual_seed(0)
+    model = Transformer(
+        vocab_size=8,
+        embedding_dim=8,
+        num_heads=2,
+        context_length=8,
+        num_layers=1,
+        pad_token_id=0,
+        dropout_rate=0.0,
+        label_smoothing=0.0,
+    ).eval()
+    source_ids = torch.tensor([[2, 4, 3], [2, 5, 3]])
+
+    generated = beam_search_generate(
+        model,
+        source_ids,
+        pad_token_id=0,
+        bos_token_id=2,
+        eos_token_id=3,
+        max_new_tokens=6,
+        beam_size=4,
+        length_penalty=0.6,
+    )
+
+    assert len(generated) == 2
+    assert all(sequence[0] == 2 for sequence in generated)
+    assert all(len(sequence) <= 6 for sequence in generated)
+
+
+def test_checkpoint_averaging(tmp_path):
+    paths = []
+    for index, value in enumerate((1.0, 3.0), start=1):
+        path = tmp_path / f"best-{index}.pt"
+        torch.save(
+            {
+                "model": {
+                    "weight": torch.tensor([value]),
+                    "counter": torch.tensor([7]),
+                },
+                "config": {"name": "tiny"},
+                "epoch": index,
+                "update": index * 100,
+                "validation_loss": 3.0 - index,
+                "best_validation_loss": 3.0 - index,
+            },
+            path,
+        )
+        paths.append(path)
+
+    averaged = average_checkpoints(paths)
+
+    assert averaged["model"]["weight"].item() == 2.0
+    assert averaged["model"]["counter"].item() == 7
+    assert averaged["epoch"] == 2
+    assert averaged["update"] == 200
+
+
+def test_retains_only_checkpoints_with_lowest_validation_losses(tmp_path):
+    model = Transformer(
+        vocab_size=8,
+        embedding_dim=8,
+        num_heads=2,
+        context_length=8,
+        num_layers=1,
+        pad_token_id=0,
+        dropout_rate=0.0,
+        label_smoothing=0.0,
+    )
+    retained = []
+    for update, loss in enumerate((3.2, 3.1, 3.3, 3.0), start=1):
+        retained = retain_best_checkpoint(
+            tmp_path,
+            model,
+            epoch=0,
+            update=update,
+            validation_loss=loss,
+            split_metadata={"name": "validation"},
+            data_config={},
+            training_args={},
+            best_checkpoints=retained,
+            keep_count=2,
+        )
+
+    assert [record["validation_loss"] for record in retained] == [3.0, 3.1]
+    assert sorted(path.name for path in tmp_path.glob("best_update_*.pt")) == sorted(
+        record["filename"] for record in retained
+    )

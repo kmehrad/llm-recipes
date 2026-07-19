@@ -1,12 +1,14 @@
-"""Train the notebook's English-German Transformer outside Jupyter.
+"""Train the WMT14 English-German Transformer outside Jupyter.
 
 Run this script in tmux so training survives SSH and VS Code disconnects. It
-automatically resumes from checkpoints/transformer_en_de/latest.pt by default.
+automatically resumes from checkpoints/transformer_en_de-v2/latest.pt.
 """
 
 from __future__ import annotations
 
 import argparse
+from array import array
+from hashlib import sha256
 from itertools import islice, zip_longest
 import json
 import math
@@ -19,14 +21,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tokenizers import Tokenizer
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset, Sampler, Subset
 from tqdm.auto import tqdm
 
 
 EMBEDDING_DIM = 512
 NUM_HEADS = 8
 NUM_LAYERS = 6
-CONTEXT_LENGTH = 128
+CONTEXT_LENGTH = 256
 DROPOUT_RATE = 0.1
 LABEL_SMOOTHING = 0.1
 
@@ -83,6 +85,153 @@ class ParallelTextDataset(Dataset):
             "source_ids": self._encode(source_text),
             "target_ids": self._encode(target_text),
         }
+
+
+class IndexedParallelTextDataset(Dataset):
+    """Parallel text backed by byte offsets instead of millions of Python strings."""
+
+    def __init__(
+        self,
+        source_path: Path,
+        target_path: Path,
+        tokenizer: Tokenizer,
+        max_seq_len: int,
+    ) -> None:
+        self.source_path = source_path
+        self.target_path = target_path
+        self.tokenizer = tokenizer
+        self.max_seq_len = max_seq_len
+        self.eos_token_id = tokenizer.token_to_id("[EOS]")
+        self.source_offsets = self._line_offsets(source_path)
+        self.target_offsets = self._line_offsets(target_path)
+        if len(self.source_offsets) != len(self.target_offsets):
+            raise ValueError("Source and target files have different line counts")
+        self._source_file = None
+        self._target_file = None
+
+    @staticmethod
+    def _line_offsets(path: Path) -> array:
+        offsets = array("Q")
+        with path.open("rb") as text_file:
+            while True:
+                offset = text_file.tell()
+                line = text_file.readline()
+                if not line:
+                    break
+                offsets.append(offset)
+        return offsets
+
+    def __getstate__(self) -> dict[str, object]:
+        state = self.__dict__.copy()
+        state["_source_file"] = None
+        state["_target_file"] = None
+        return state
+
+    def __len__(self) -> int:
+        return len(self.source_offsets)
+
+    def _open_files(self) -> None:
+        if self._source_file is None:
+            self._source_file = self.source_path.open("rb")
+            self._target_file = self.target_path.open("rb")
+
+    def _encode(self, text: str) -> list[int]:
+        token_ids = self.tokenizer.encode(text).ids
+        if len(token_ids) > self.max_seq_len:
+            token_ids = token_ids[: self.max_seq_len - 1] + [self.eos_token_id]
+        return token_ids
+
+    def __getitem__(self, index: int) -> dict[str, list[int]]:
+        self._open_files()
+        self._source_file.seek(self.source_offsets[index])
+        self._target_file.seek(self.target_offsets[index])
+        source = self._source_file.readline().decode("utf-8").rstrip()
+        target = self._target_file.readline().decode("utf-8").rstrip()
+        return {
+            "source_ids": self._encode(source),
+            "target_ids": self._encode(target),
+        }
+
+    def text_pair(self, index: int) -> tuple[str, str]:
+        self._open_files()
+        self._source_file.seek(self.source_offsets[index])
+        self._target_file.seek(self.target_offsets[index])
+        return (
+            self._source_file.readline().decode("utf-8").rstrip(),
+            self._target_file.readline().decode("utf-8").rstrip(),
+        )
+
+
+class TokenBucketBatchSampler(Sampler[list[int]]):
+    """Deterministic shuffled batches bounded by padded source+target tokens."""
+
+    def __init__(
+        self,
+        source_lengths: torch.Tensor,
+        target_lengths: torch.Tensor,
+        max_tokens: int,
+        seed: int,
+        epoch: int,
+        bucket_size: int = 2_048,
+        max_sentences: int = 256,
+    ) -> None:
+        if len(source_lengths) != len(target_lengths):
+            raise ValueError("Source and target length caches differ")
+        self.batches = self._make_batches(
+            source_lengths,
+            target_lengths,
+            max_tokens,
+            seed,
+            epoch,
+            bucket_size,
+            max_sentences,
+        )
+
+    @staticmethod
+    def _make_batches(
+        source_lengths: torch.Tensor,
+        target_lengths: torch.Tensor,
+        max_tokens: int,
+        seed: int,
+        epoch: int,
+        bucket_size: int,
+        max_sentences: int,
+    ) -> list[list[int]]:
+        generator = torch.Generator().manual_seed(seed + epoch)
+        order = torch.randperm(len(source_lengths), generator=generator).tolist()
+        batches: list[list[int]] = []
+        for start in range(0, len(order), bucket_size):
+            bucket = order[start : start + bucket_size]
+            bucket.sort(
+                key=lambda index: int(source_lengths[index] + target_lengths[index])
+            )
+            batch: list[int] = []
+            max_source = max_target = 0
+            for index in bucket:
+                source_length = int(source_lengths[index])
+                target_length = int(target_lengths[index])
+                next_max_source = max(max_source, source_length)
+                next_max_target = max(max_target, target_length)
+                padded_tokens = (next_max_source + next_max_target) * (len(batch) + 1)
+                if batch and (
+                    padded_tokens > max_tokens or len(batch) >= max_sentences
+                ):
+                    batches.append(batch)
+                    batch = []
+                    max_source = max_target = 0
+                batch.append(index)
+                max_source = max(max_source, source_length)
+                max_target = max(max_target, target_length)
+            if batch:
+                batches.append(batch)
+        permutation = torch.randperm(len(batches), generator=generator).tolist()
+        return [batches[index] for index in permutation]
+
+    def __iter__(self):
+        return iter(self.batches)
+
+    def __len__(self) -> int:
+        return len(self.batches)
 
 
 def source_grouped_split(
@@ -422,6 +571,33 @@ class Transformer(nn.Module):
             + self.position_encodings(positions)
         )
 
+    def encode(
+        self,
+        source_ids: torch.Tensor,
+        source_padding_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.encoder(
+            self._embed(source_ids), padding_mask=source_padding_mask
+        )
+
+    def decode(
+        self,
+        decoder_input_ids: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        decoder_padding_mask: torch.Tensor,
+        source_padding_mask: torch.Tensor,
+        last_token_only: bool = False,
+    ) -> torch.Tensor:
+        decoder_hidden_states = self.decoder(
+            self._embed(decoder_input_ids),
+            encoder_hidden_states,
+            decoder_padding_mask,
+            source_padding_mask,
+        )
+        if last_token_only:
+            decoder_hidden_states = decoder_hidden_states[:, -1:]
+        return self.lm_head(decoder_hidden_states)
+
     def forward(
         self,
         source_ids: torch.Tensor,
@@ -429,19 +605,20 @@ class Transformer(nn.Module):
         source_padding_mask: torch.Tensor,
         decoder_padding_mask: torch.Tensor,
         labels: torch.Tensor | None = None,
+        last_token_only: bool = False,
     ) -> dict[str, torch.Tensor | None]:
-        encoder_hidden_states = self.encoder(
-            self._embed(source_ids), padding_mask=source_padding_mask
-        )
-        decoder_hidden_states = self.decoder(
-            self._embed(decoder_input_ids),
+        encoder_hidden_states = self.encode(source_ids, source_padding_mask)
+        logits = self.decode(
+            decoder_input_ids,
             encoder_hidden_states,
             decoder_padding_mask,
             source_padding_mask,
+            last_token_only=last_token_only,
         )
-        logits = self.lm_head(decoder_hidden_states)
         loss = None
         if labels is not None:
+            if last_token_only:
+                raise ValueError("last_token_only cannot be used with labels")
             loss = F.cross_entropy(
                 logits.reshape(-1, logits.shape[-1]),
                 labels.reshape(-1),
@@ -503,9 +680,11 @@ def save_checkpoint(
     update: int,
     best_validation_loss: float,
     elapsed_seconds: float,
-    validation_indices: list[int],
+    split_metadata: dict[str, object],
+    data_config: dict[str, str],
     early_stopping_bad_checks: int,
     training_args: dict[str, object],
+    best_checkpoints: list[dict[str, object]],
 ) -> None:
     state = {
         "model": model.state_dict(),
@@ -520,12 +699,44 @@ def save_checkpoint(
         "torch_rng_state": torch.get_rng_state(),
         "cuda_rng_state_all": torch.cuda.get_rng_state_all(),
         "python_rng_state": random.getstate(),
-        "split": {
-            "strategy": "grouped_by_exact_source_v1",
-            "validation_indices": validation_indices,
-            "validation_examples": len(validation_indices),
-            "seed": training_args["seed"],
+        "split": split_metadata,
+        "data": data_config,
+        "training_args": training_args,
+        "best_checkpoints": best_checkpoints,
+        "config": {
+            "vocab_size": model.token_embeddings.num_embeddings,
+            "embedding_dim": EMBEDDING_DIM,
+            "num_heads": NUM_HEADS,
+            "num_layers": NUM_LAYERS,
+            "context_length": CONTEXT_LENGTH,
+            "pad_token_id": model.pad_token_id,
+            "dropout_rate": DROPOUT_RATE,
+            "label_smoothing": LABEL_SMOOTHING,
         },
+    }
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(state, temporary_path)
+    temporary_path.replace(path)
+
+
+def save_model_checkpoint(
+    path: Path,
+    model: Transformer,
+    epoch: int,
+    update: int,
+    validation_loss: float,
+    split_metadata: dict[str, object],
+    data_config: dict[str, str],
+    training_args: dict[str, object],
+) -> None:
+    state = {
+        "model": model.state_dict(),
+        "epoch": epoch,
+        "update": update,
+        "best_validation_loss": validation_loss,
+        "validation_loss": validation_loss,
+        "split": split_metadata,
+        "data": data_config,
         "training_args": training_args,
         "config": {
             "vocab_size": model.token_embeddings.num_embeddings,
@@ -543,27 +754,102 @@ def save_checkpoint(
     temporary_path.replace(path)
 
 
+def retain_best_checkpoint(
+    checkpoint_dir: Path,
+    model: Transformer,
+    epoch: int,
+    update: int,
+    validation_loss: float,
+    split_metadata: dict[str, object],
+    data_config: dict[str, str],
+    training_args: dict[str, object],
+    best_checkpoints: list[dict[str, object]],
+    keep_count: int,
+) -> list[dict[str, object]]:
+    ranked = list(best_checkpoints)
+    qualifies = len(ranked) < keep_count or validation_loss < float(
+        ranked[-1]["validation_loss"]
+    )
+    if not qualifies:
+        return ranked
+    filename = f"best_update_{update:08d}_loss_{validation_loss:.4f}.pt"
+    save_model_checkpoint(
+        checkpoint_dir / filename,
+        model,
+        epoch,
+        update,
+        validation_loss,
+        split_metadata,
+        data_config,
+        training_args,
+    )
+    ranked.append(
+        {
+            "filename": filename,
+            "update": update,
+            "epoch": epoch,
+            "validation_loss": validation_loss,
+        }
+    )
+    ranked.sort(key=lambda item: float(item["validation_loss"]))
+    while len(ranked) > keep_count:
+        removed = ranked.pop()
+        removed_path = checkpoint_dir / str(removed["filename"])
+        if removed_path.exists():
+            removed_path.unlink()
+    return ranked
+
+
 def parse_args() -> argparse.Namespace:
+    repo_root = find_repo_root(Path(__file__).resolve())
+    data_dir = repo_root / "data/processed/wmt14_en_de"
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--max-hours", type=float, default=8.0, help="Hours for this run")
-    parser.add_argument("--max-epochs", type=int, default=200)
+    parser.add_argument("--max-epochs", type=int, default=20)
     parser.add_argument("--max-updates", type=int, default=None, help="Total update limit")
-    parser.add_argument("--micro-batch-size", type=int, default=64)
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
-    parser.add_argument("--validation-examples", type=int, default=5_000)
-    parser.add_argument("--validation-interval", type=int, default=500)
+    parser.add_argument("--micro-batch-tokens", type=int, default=4_096)
+    parser.add_argument("--max-sentences-per-batch", type=int, default=256)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
+    parser.add_argument("--validation-batch-size", type=int, default=64)
+    parser.add_argument("--validation-interval", type=int, default=1_000)
     parser.add_argument("--early-stopping-patience", type=int, default=10)
     parser.add_argument("--early-stopping-min-delta", type=float, default=0.001)
+    parser.add_argument("--keep-best-checkpoints", type=int, default=5)
     parser.add_argument("--checkpoint-interval", type=int, default=100)
     parser.add_argument("--log-interval", type=int, default=20)
     parser.add_argument("--warmup-steps", type=int, default=4_000)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--train-source", type=Path, default=data_dir / "train.en"
+    )
+    parser.add_argument(
+        "--train-target", type=Path, default=data_dir / "train.de"
+    )
+    parser.add_argument(
+        "--validation-source", type=Path, default=data_dir / "validation.en"
+    )
+    parser.add_argument(
+        "--validation-target", type=Path, default=data_dir / "validation.de"
+    )
+    parser.add_argument(
+        "--test-source", type=Path, default=data_dir / "test.en"
+    )
+    parser.add_argument(
+        "--test-target", type=Path, default=data_dir / "test.de"
+    )
+    parser.add_argument(
+        "--tokenizer-path",
+        type=Path,
+        default=repo_root / "data/tokenizers/wmt14_bpe_en_de.json",
+    )
+    parser.add_argument(
+        "--length-cache", type=Path, default=data_dir / "train.lengths.pt"
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
-        default=None,
-        help="Checkpoint/log directory (default: checkpoints/transformer_en_de)",
+        default=repo_root / "checkpoints/transformer_en_de-v2",
     )
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
@@ -577,20 +863,54 @@ def main() -> None:
         raise ValueError("--max-epochs must be positive")
     if args.gradient_accumulation_steps <= 0:
         raise ValueError("--gradient-accumulation-steps must be positive")
+    if args.micro_batch_tokens <= 0:
+        raise ValueError("--micro-batch-tokens must be positive")
+    if args.max_sentences_per_batch <= 0:
+        raise ValueError("--max-sentences-per-batch must be positive")
+    if args.validation_batch_size <= 0:
+        raise ValueError("--validation-batch-size must be positive")
     if args.validation_interval <= 0:
         raise ValueError("--validation-interval must be positive")
     if args.early_stopping_patience <= 0:
         raise ValueError("--early-stopping-patience must be positive")
     if args.early_stopping_min_delta < 0:
         raise ValueError("--early-stopping-min-delta cannot be negative")
+    if args.keep_best_checkpoints <= 0:
+        raise ValueError("--keep-best-checkpoints must be positive")
     if not torch.cuda.is_available():
         raise RuntimeError("This training script expects a CUDA GPU")
 
     repo_root = find_repo_root(Path(__file__).resolve())
-    tokenizer_path = repo_root / "data/tokenizers/tatoeba_bpe_en_de.json"
-    english_path = repo_root / "data/raw/tatoeba_en_de/Tatoeba.de-en.en"
-    german_path = repo_root / "data/raw/tatoeba_en_de/Tatoeba.de-en.de"
-    checkpoint_dir = args.output_dir or repo_root / "checkpoints/transformer_en_de"
+    def absolute(path: Path) -> Path:
+        return path if path.is_absolute() else repo_root / path
+
+    tokenizer_path = absolute(args.tokenizer_path)
+    train_source_path = absolute(args.train_source)
+    train_target_path = absolute(args.train_target)
+    validation_source_path = absolute(args.validation_source)
+    validation_target_path = absolute(args.validation_target)
+    test_source_path = absolute(args.test_source)
+    test_target_path = absolute(args.test_target)
+    length_cache_path = absolute(args.length_cache)
+    required_paths = (
+        tokenizer_path,
+        train_source_path,
+        train_target_path,
+        validation_source_path,
+        validation_target_path,
+        test_source_path,
+        test_target_path,
+        length_cache_path,
+    )
+    missing_paths = [path for path in required_paths if not path.exists()]
+    if missing_paths:
+        raise FileNotFoundError(
+            "WMT v2 inputs are missing:\n"
+            + "\n".join(f"- {path}" for path in missing_paths)
+            + "\nRun prepare_wmt14_en_de.py and train_wmt_tokenizer.py first."
+        )
+
+    checkpoint_dir = absolute(args.output_dir)
     if not checkpoint_dir.is_absolute():
         checkpoint_dir = repo_root / checkpoint_dir
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -603,40 +923,80 @@ def main() -> None:
     pad_token_id = tokenizer.token_to_id("[PAD]")
     if pad_token_id is None:
         raise ValueError("Tokenizer does not define [PAD]")
-    all_dataset = ParallelTextDataset(
-        english_path, german_path, tokenizer, CONTEXT_LENGTH
+    train_dataset = IndexedParallelTextDataset(
+        train_source_path, train_target_path, tokenizer, CONTEXT_LENGTH
     )
-    train_dataset, validation_dataset, validation_indices = source_grouped_split(
-        all_dataset, args.validation_examples, args.seed
+    validation_dataset = IndexedParallelTextDataset(
+        validation_source_path,
+        validation_target_path,
+        tokenizer,
+        CONTEXT_LENGTH,
     )
+    length_cache = torch.load(length_cache_path, map_location="cpu", weights_only=True)
+    tokenizer_digest = sha256(tokenizer.to_str().encode("utf-8")).hexdigest()
+    if length_cache.get("tokenizer_sha256") != tokenizer_digest:
+        raise ValueError("Token-length cache was built with a different tokenizer")
+    source_lengths = length_cache["source_lengths"].to(torch.int32)
+    target_lengths = length_cache["target_lengths"].to(torch.int32)
+    if len(source_lengths) != len(train_dataset):
+        raise ValueError("Token-length cache does not match the WMT training files")
+    if length_cache.get("max_seq_len") != CONTEXT_LENGTH:
+        raise ValueError("Token-length cache context length does not match the model")
+    split_metadata: dict[str, object] = {
+        "strategy": "external_validation_v1",
+        "validation_examples": len(validation_dataset),
+        "name": "newstest2013",
+        "test_name": "newstest2014",
+    }
+    data_config = {
+        "tokenizer_path": str(tokenizer_path),
+        "train_source": str(train_source_path),
+        "train_target": str(train_target_path),
+        "validation_source": str(validation_source_path),
+        "validation_target": str(validation_target_path),
+        "test_source": str(test_source_path),
+        "test_target": str(test_target_path),
+        "length_cache": str(length_cache_path),
+        "tokenizer_sha256": tokenizer_digest,
+        "train_source_bytes": str(train_source_path.stat().st_size),
+        "train_target_bytes": str(train_target_path.stat().st_size),
+        "validation_source_bytes": str(validation_source_path.stat().st_size),
+        "validation_target_bytes": str(validation_target_path.stat().st_size),
+    }
     training_args: dict[str, object] = {
         "seed": args.seed,
-        "validation_examples": args.validation_examples,
         "warmup_steps": args.warmup_steps,
-        "micro_batch_size": args.micro_batch_size,
+        "micro_batch_tokens": args.micro_batch_tokens,
+        "max_sentences_per_batch": args.max_sentences_per_batch,
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "validation_interval": args.validation_interval,
         "early_stopping_patience": args.early_stopping_patience,
         "early_stopping_min_delta": args.early_stopping_min_delta,
+        "keep_best_checkpoints": args.keep_best_checkpoints,
     }
     collator = TranslationCollator(pad_token_id)
 
     def make_train_loader(epoch_number: int) -> DataLoader:
+        batch_sampler = TokenBucketBatchSampler(
+            source_lengths,
+            target_lengths,
+            args.micro_batch_tokens,
+            args.seed,
+            epoch_number,
+            max_sentences=args.max_sentences_per_batch,
+        )
         return DataLoader(
             train_dataset,
-            batch_size=args.micro_batch_size,
-            shuffle=True,
-            generator=torch.Generator().manual_seed(args.seed + epoch_number),
+            batch_sampler=batch_sampler,
             collate_fn=collator,
             num_workers=args.num_workers,
             pin_memory=True,
             persistent_workers=args.num_workers > 0,
-            drop_last=False,
         )
 
     validation_loader = DataLoader(
         validation_dataset,
-        batch_size=args.micro_batch_size,
+        batch_size=args.validation_batch_size,
         shuffle=False,
         collate_fn=collator,
         num_workers=args.num_workers,
@@ -667,6 +1027,7 @@ def main() -> None:
     epoch = next_batch = update = 0
     best_validation_loss = math.inf
     early_stopping_bad_checks = 0
+    best_checkpoints: list[dict[str, object]] = []
     previous_elapsed = 0.0
 
     if args.resume and latest_checkpoint_path.exists():
@@ -674,20 +1035,22 @@ def main() -> None:
             latest_checkpoint_path, map_location="cpu", weights_only=False
         )
         checkpoint_split = checkpoint.get("split")
-        if checkpoint_split is None:
+        if checkpoint_split != split_metadata:
             raise ValueError(
-                "The checkpoint uses the legacy row-random split. Resume it with the "
-                "old script, or start this grouped-split run with --no-resume."
+                "Checkpoint validation data does not match the current WMT inputs; "
+                "use matching paths or --no-resume with a new output directory."
             )
-        if checkpoint_split.get("strategy") != "grouped_by_exact_source_v1":
-            raise ValueError(f"Unsupported checkpoint split: {checkpoint_split}")
-        if checkpoint_split.get("validation_indices") != validation_indices:
+        if checkpoint.get("data") != data_config:
             raise ValueError(
-                "Checkpoint validation split does not match --seed/"
-                "--validation-examples; use matching settings or --no-resume."
+                "Checkpoint data/tokenizer paths do not match the current v2 inputs"
             )
         saved_args = checkpoint.get("training_args", {})
-        for name in ("seed", "validation_examples", "warmup_steps"):
+        for name in (
+            "seed",
+            "warmup_steps",
+            "micro_batch_tokens",
+            "gradient_accumulation_steps",
+        ):
             if saved_args.get(name) != training_args[name]:
                 raise ValueError(
                     f"Checkpoint {name}={saved_args.get(name)!r} does not match "
@@ -704,6 +1067,7 @@ def main() -> None:
         early_stopping_bad_checks = checkpoint.get(
             "early_stopping_bad_checks", 0
         )
+        best_checkpoints = checkpoint.get("best_checkpoints", [])
         previous_elapsed = checkpoint.get("elapsed_seconds", 0.0)
         if "torch_rng_state" in checkpoint:
             torch.set_rng_state(checkpoint["torch_rng_state"])
@@ -736,7 +1100,8 @@ def main() -> None:
         flush=True,
     )
     print(
-        f"Effective batch: {args.micro_batch_size * args.gradient_accumulation_steps} pairs; "
+        f"Approximate effective batch ceiling: "
+        f"{args.micro_batch_tokens * args.gradient_accumulation_steps:,} padded tokens; "
         f"session budget: {args.max_hours:g} h",
         flush=True,
     )
@@ -827,6 +1192,18 @@ def main() -> None:
                     validation_loss
                     < best_validation_loss - args.early_stopping_min_delta
                 )
+                best_checkpoints = retain_best_checkpoint(
+                    checkpoint_dir,
+                    model,
+                    epoch,
+                    update,
+                    validation_loss,
+                    split_metadata,
+                    data_config,
+                    training_args,
+                    best_checkpoints,
+                    args.keep_best_checkpoints,
+                )
                 append_history(
                     history_path,
                     {
@@ -838,6 +1215,7 @@ def main() -> None:
                             validation_loss if improved else best_validation_loss
                         ),
                         "improved": improved,
+                        "retained_best_checkpoints": best_checkpoints,
                         "elapsed_hours": total_elapsed / 3600,
                     },
                 )
@@ -854,9 +1232,11 @@ def main() -> None:
                         update,
                         best_validation_loss,
                         total_elapsed,
-                        validation_indices,
+                        split_metadata,
+                        data_config,
                         early_stopping_bad_checks,
                         training_args,
+                        best_checkpoints,
                     )
                 else:
                     early_stopping_bad_checks += 1
@@ -866,6 +1246,24 @@ def main() -> None:
                         f"{args.early_stopping_patience})",
                         flush=True,
                     )
+                # Persist the updated ranking immediately. Validation and regular
+                # checkpoint intervals are configurable and need not coincide.
+                save_checkpoint(
+                    latest_checkpoint_path,
+                    model,
+                    optimizer,
+                    scaler,
+                    epoch,
+                    batch_index + 1,
+                    update,
+                    best_validation_loss,
+                    total_elapsed,
+                    split_metadata,
+                    data_config,
+                    early_stopping_bad_checks,
+                    training_args,
+                    best_checkpoints,
+                )
             if update % args.checkpoint_interval == 0:
                 save_checkpoint(
                     latest_checkpoint_path,
@@ -877,9 +1275,11 @@ def main() -> None:
                     update,
                     best_validation_loss,
                     total_elapsed,
-                    validation_indices,
+                    split_metadata,
+                    data_config,
                     early_stopping_bad_checks,
                     training_args,
+                    best_checkpoints,
                 )
                 print(f"Saved checkpoint at update {update:,}", flush=True)
 
@@ -916,9 +1316,11 @@ def main() -> None:
         update,
         best_validation_loss,
         total_elapsed,
-        validation_indices,
+        split_metadata,
+        data_config,
         early_stopping_bad_checks,
         training_args,
+        best_checkpoints,
     )
     print(
         f"Stopped safely ({stop_reason}) after "
