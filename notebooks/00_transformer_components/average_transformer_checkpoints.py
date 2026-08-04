@@ -68,7 +68,7 @@ def average_checkpoints(paths: list[Path]) -> dict[str, object]:
 
 def parse_args() -> argparse.Namespace:
     repo_root = find_repo_root(Path(__file__).resolve())
-    checkpoint_dir = repo_root / "checkpoints/transformer_en_de-v2"
+    checkpoint_dir = repo_root / "checkpoints/transformer_en_de"
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--training-checkpoint",
