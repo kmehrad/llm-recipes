@@ -1,7 +1,7 @@
 """Train the WMT14 English-German Transformer outside Jupyter.
 
 Run this script in tmux so training survives SSH and VS Code disconnects. It
-automatically resumes from checkpoints/transformer_en_de-v2/latest.pt.
+automatically resumes from checkpoints/transformer_en_de/latest.pt.
 """
 
 from __future__ import annotations
@@ -849,7 +849,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=repo_root / "checkpoints/transformer_en_de-v2",
+        default=repo_root / "checkpoints/transformer_en_de",
     )
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()

@@ -18,7 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=repo_root / "checkpoints/transformer_en_de-v2/averaged.pt",
+        default=repo_root / "checkpoints/transformer_en_de/averaged.pt",
         help="Averaged or individual model checkpoint",
     )
     parser.add_argument(
